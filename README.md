@@ -1,6 +1,8 @@
 # Pi Token Saver
 
-A [Pi](https://github.com/badlogic/pi-mono) package that retains recent tool results in model context and replaces older text-only results with a short pointer to archived full output. It changes only the outgoing context—never session JSONL—and fails open if archiving is unavailable.
+A [Pi](https://github.com/badlogic/pi-mono) package that retains recent tool results in model context and replaces older text-only results with a short pointer to archived full output. It changes only the outgoing context—never session JSONL—and fails open if archiving or integrity verification is unavailable.
+
+Each archive has an authoritative `.txt` payload and a small `.manifest.json` containing the originating session/tool identity and a SHA-256 of the payload. The extension verifies both before masking; it never overwrites a conflicting archive.
 
 ## Install
 

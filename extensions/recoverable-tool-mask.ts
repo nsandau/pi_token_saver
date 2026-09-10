@@ -51,7 +51,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve } from "node:path";
 
@@ -110,8 +110,12 @@ function safeComponent(value: string, maxLen = 80): string {
   return (cleaned || "unknown").slice(0, maxLen);
 }
 
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 function shortHash(value: string): string {
-  return createHash("sha256").update(value).digest("hex").slice(0, 20);
+  return sha256(value).slice(0, 20);
 }
 
 function estimateTokensFromChars(chars: number): number {
@@ -136,11 +140,32 @@ type ToolCallInfo = {
   arguments: Record<string, unknown>;
 };
 
+type ArchiveManifest = {
+  version: 2;
+  sessionId: string;
+  sessionFile: string | null;
+  toolCallId: string;
+  toolName: string;
+  isError: boolean;
+  originalEstimatedTokens: number;
+  textBytes: number;
+  textSha256: string;
+  archivedAt: string;
+};
+
 type ArchiveRecord = {
   txtPath: string;
-  jsonPath: string;
+  manifestPath: string;
   created: boolean;
+  verified: true;
 };
+
+class ArchiveIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ArchiveIntegrityError";
+  }
+}
 
 type ProviderUsageTotals = {
   calls: number;
@@ -161,6 +186,9 @@ type MaskStats = {
   skippedImageResults: number;
   skippedTooSmallResults: number;
   archiveFailures: number;
+  archiveIntegrityFailures: number;
+  archiveVerifications: number;
+  archiveManifestCreations: number;
   recoveryToolCalls: number;
   recoveredArchivePaths: Set<string>;
   estimatedExposureAvoided: number;
@@ -184,6 +212,9 @@ function newStats(sessionId = ""): MaskStats {
     skippedImageResults: 0,
     skippedTooSmallResults: 0,
     archiveFailures: 0,
+    archiveIntegrityFailures: 0,
+    archiveVerifications: 0,
+    archiveManifestCreations: 0,
     recoveryToolCalls: 0,
     recoveredArchivePaths: new Set(),
     estimatedExposureAvoided: 0,
@@ -354,58 +385,158 @@ async function writeOnce(path: string, data: string): Promise<boolean> {
   }
 }
 
+function getSessionArchiveDir(
+  archiveRoot: string,
+  sessionId: string,
+  sessionFile: string | null,
+): string {
+  const fingerprint = shortHash(`${sessionId}\n${sessionFile ?? ""}`);
+  return join(archiveRoot, `${safeComponent(sessionId, 40)}-${fingerprint}`);
+}
+
+function buildArchiveManifest(params: {
+  sessionId: string;
+  sessionFile: string | null;
+  message: AnyMessage;
+  originalTokens: number;
+  text: Buffer;
+}): ArchiveManifest {
+  const { sessionId, sessionFile, message, originalTokens, text } = params;
+  return {
+    version: 2,
+    sessionId,
+    sessionFile,
+    toolCallId: String(message.toolCallId),
+    toolName: String(message.toolName ?? "unknown"),
+    isError: Boolean(message.isError),
+    originalEstimatedTokens: originalTokens,
+    textBytes: text.byteLength,
+    textSha256: sha256(text),
+    archivedAt: new Date().toISOString(),
+  };
+}
+
+function hasMatchingIdentity(
+  manifest: ArchiveManifest,
+  expected: ArchiveManifest,
+): boolean {
+  return (
+    manifest.version === 2 &&
+    manifest.sessionId === expected.sessionId &&
+    manifest.sessionFile === expected.sessionFile &&
+    manifest.toolCallId === expected.toolCallId &&
+    manifest.toolName === expected.toolName &&
+    manifest.isError === expected.isError &&
+    manifest.originalEstimatedTokens === expected.originalEstimatedTokens &&
+    typeof manifest.archivedAt === "string"
+  );
+}
+
+async function readManifest(path: string): Promise<ArchiveManifest> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    throw new ArchiveIntegrityError(`Cannot read archive manifest: ${String(error)}`);
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    throw new ArchiveIntegrityError("Archive manifest is not an object");
+  }
+  return parsed as ArchiveManifest;
+}
+
+async function verifyArchive(params: {
+  txtPath: string;
+  manifestPath: string;
+  expected: ArchiveManifest;
+  stats: MaskStats;
+}): Promise<void> {
+  const { txtPath, manifestPath, expected, stats } = params;
+  stats.archiveVerifications++;
+
+  const manifest = await readManifest(manifestPath);
+  if (!hasMatchingIdentity(manifest, expected)) {
+    throw new ArchiveIntegrityError("Archive manifest identity does not match the tool result");
+  }
+
+  let archivedText: Buffer;
+  try {
+    archivedText = await readFile(txtPath);
+  } catch (error) {
+    throw new ArchiveIntegrityError(`Cannot read archived result: ${String(error)}`);
+  }
+
+  const archivedHash = sha256(archivedText);
+  if (
+    manifest.textBytes !== archivedText.byteLength ||
+    manifest.textSha256 !== archivedHash ||
+    archivedText.byteLength !== expected.textBytes ||
+    archivedHash !== expected.textSha256
+  ) {
+    throw new ArchiveIntegrityError("Archived result hash does not match its manifest or tool result");
+  }
+}
+
 async function ensureArchived(params: {
   archiveRoot: string;
   sessionId: string;
+  sessionFile: string | null;
   message: AnyMessage;
   originalTokens: number;
   stats: MaskStats;
 }): Promise<ArchiveRecord> {
-  const { archiveRoot, sessionId, message, originalTokens, stats } = params;
-  const sessionDir = join(archiveRoot, safeComponent(sessionId));
+  const { archiveRoot, sessionId, sessionFile, message, originalTokens, stats } = params;
+  const sessionDir = getSessionArchiveDir(archiveRoot, sessionId, sessionFile);
   await mkdir(sessionDir, { recursive: true, mode: 0o700 });
 
   const toolName = safeComponent(String(message.toolName ?? "tool"), 40);
   const idHash = shortHash(String(message.toolCallId));
   const base = `${toolName}-${idHash}`;
   const txtPath = join(sessionDir, `${base}.txt`);
-  const jsonPath = join(sessionDir, `${base}.json`);
+  const manifestPath = join(sessionDir, `${base}.manifest.json`);
+  const text = Buffer.from(textForArchive(message.content), "utf8");
+  const expected = buildArchiveManifest({
+    sessionId,
+    sessionFile,
+    message,
+    originalTokens,
+    text,
+  });
 
-  const text = textForArchive(message.content);
-  const txtAlreadyExists = await fileExists(txtPath);
-
+  const txtExists = await fileExists(txtPath);
+  const manifestExists = await fileExists(manifestPath);
   let created = false;
-  if (!txtAlreadyExists) {
-    created = await writeOnce(txtPath, text);
-    if (created) stats.archiveBytesWritten += Buffer.byteLength(text, "utf8");
+
+  if (!txtExists && manifestExists) {
+    throw new ArchiveIntegrityError("Archive manifest exists without its result file");
   }
 
-  // Sidecar preserves the original content-block structure exactly. It is not
-  // required for normal recovery; the .txt file is the model-friendly path.
-  if (!(await fileExists(jsonPath))) {
-    const sidecar = JSON.stringify(
-      {
-        version: 1,
-        sessionId,
-        toolCallId: message.toolCallId,
-        toolName: message.toolName,
-        isError: Boolean(message.isError),
-        timestamp: message.timestamp,
-        originalEstimatedTokens: originalTokens,
-        content: message.content,
-      },
-      null,
-      2,
-    );
-    try {
-      await writeOnce(jsonPath, `${sidecar}\n`);
-    } catch {
-      // The .txt archive is sufficient for recovery. Do not fail masking only
-      // because the metadata sidecar could not be written.
+  if (!txtExists) {
+    const wroteText = await writeOnce(txtPath, text.toString("utf8"));
+    if (wroteText) {
+      created = true;
+      stats.archiveBytesWritten += text.byteLength;
     }
   }
 
-  return { txtPath, jsonPath, created };
+  // An existing .txt (including a version-1 archive) is trusted only after it
+  // matches the current tool result. The legacy .json sidecar is left intact.
+  const manifestJson = `${JSON.stringify(expected, null, 2)}\n`;
+  if (!(await fileExists(manifestPath))) {
+    const currentText = await readFile(txtPath);
+    if (currentText.byteLength !== expected.textBytes || sha256(currentText) !== expected.textSha256) {
+      throw new ArchiveIntegrityError("Existing archived result does not match the tool result");
+    }
+    const wroteManifest = await writeOnce(manifestPath, manifestJson);
+    if (wroteManifest) {
+      created = true;
+      stats.archiveManifestCreations++;
+    }
+  }
+
+  await verifyArchive({ txtPath, manifestPath, expected, stats });
+  return { txtPath, manifestPath, created, verified: true };
 }
 
 function makeStub(toolName: string, originalTokens: number, fullPath: string): string {
@@ -456,6 +587,9 @@ function statsText(params: {
     `unique archived results:     ${formatInt(stats.uniqueArchivedResults.size)}`,
     `estimated exposure avoided: ~${formatInt(stats.estimatedExposureAvoided)} tokens`,
     `archive bytes written:       ${formatInt(stats.archiveBytesWritten)}`,
+    `archive verifications:       ${formatInt(stats.archiveVerifications)}`,
+    `archive manifests created:   ${formatInt(stats.archiveManifestCreations)}`,
+    `archive integrity failures:  ${formatInt(stats.archiveIntegrityFailures)}`,
     `recovery tool calls:         ${formatInt(stats.recoveryToolCalls)}`,
     `unique recovery targets:     ${formatInt(stats.recoveredArchivePaths.size)}`,
     `skipped image results:       ${formatInt(stats.skippedImageResults)}`,
@@ -489,9 +623,11 @@ export default function recoverableToolMask(pi: ExtensionAPI) {
   let stats = newStats();
 
   pi.on("session_start", async (_event, ctx) => {
-    stats = newStats(ctx.sessionManager.getSessionId());
+    const sessionId = ctx.sessionManager.getSessionId();
+    const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+    stats = newStats(sessionId);
     try {
-      await mkdir(join(archiveRoot, safeComponent(stats.sessionId)), {
+      await mkdir(getSessionArchiveDir(archiveRoot, sessionId, sessionFile), {
         recursive: true,
         mode: 0o700,
       });
@@ -538,6 +674,7 @@ export default function recoverableToolMask(pi: ExtensionAPI) {
     const callMap = buildToolCallMap(messages);
     const callsAfter = assistantCallsAfter(messages);
     const sessionId = ctx.sessionManager.getSessionId() || stats.sessionId || "ephemeral";
+    const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
 
     let currentOriginalToolTokens = 0;
     let currentAfterMaskToolTokens = 0;
@@ -584,23 +721,30 @@ export default function recoverableToolMask(pi: ExtensionAPI) {
       }
 
       const call = callMap.get(message.toolCallId);
-      let pointerPath = archiveReadTarget(call, archiveRoot);
+      // Keep recovery reads verbatim. Pointing a new tool result at an archive
+      // created for a different tool call would violate archive identity, while
+      // re-archiving recovery output would create an unnecessary chain.
+      if (archiveReadTarget(call, archiveRoot)) {
+        currentAfterMaskToolTokens += originalTokens;
+        continue;
+      }
 
+      let pointerPath: string;
       try {
-        if (!pointerPath) {
-          const archived = await ensureArchived({
-            archiveRoot,
-            sessionId,
-            message,
-            originalTokens,
-            stats,
-          });
-          pointerPath = archived.txtPath;
-          stats.uniqueArchivedResults.add(`${sessionId}:${message.toolCallId}`);
-        }
+        const archived = await ensureArchived({
+          archiveRoot,
+          sessionId,
+          sessionFile,
+          message,
+          originalTokens,
+          stats,
+        });
+        pointerPath = archived.txtPath;
+        stats.uniqueArchivedResults.add(`${sessionId}:${message.toolCallId}`);
       } catch (error) {
         // Fail open: never remove information if we cannot prove it is archived.
         stats.archiveFailures++;
+        if (error instanceof ArchiveIntegrityError) stats.archiveIntegrityFailures++;
         currentAfterMaskToolTokens += originalTokens;
         continue;
       }
