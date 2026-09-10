@@ -19,7 +19,7 @@
  * -------
  *   pi install git:github.com/nsandau/pi_token_saver
  *
- * Pi discovers this extension through the package.json `pi.extensions` manifest.
+ * Pi discovers this extension from the package's conventional `extensions/` directory.
  *
  * Default configuration
  * ---------------------
