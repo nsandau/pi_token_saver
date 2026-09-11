@@ -1,6 +1,6 @@
 # Pi Token Saver
 
-A [Pi](https://github.com/badlogic/pi-mono) package that retains recent tool results in model context and replaces older text-only results with a short pointer to archived full output. It changes only the outgoing context—never session JSONL—and fails open if archiving or integrity verification is unavailable.
+A [Pi](https://github.com/badlogic/pi-mono) package that retains recent tool results in model context and commits older text-only results to short archived-output pointers in reclaimable-token batches. It changes only the outgoing context—never session JSONL—and fails open if archiving or integrity verification is unavailable.
 
 Each archive has an authoritative `.txt` payload and a small `.manifest.json` containing the originating session/tool identity and a SHA-256 of the payload. The extension verifies both before masking; it never overwrites a conflicting archive.
 
@@ -25,7 +25,8 @@ Update the installed package with `pi update --extensions`.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PI_TOOL_MASK_ENABLED` | `1` | Set to `0` to disable masking. |
-| `PI_TOOL_MASK_WINDOW` | `10` | Number of later model calls that retain full tool output. |
+| `PI_TOOL_MASK_WINDOW` | `10` | Number of later model calls before a result becomes eligible for masking. |
+| `PI_TOOL_MASK_BATCH_THRESHOLD` | `10000` | Reclaimable tokens required to commit eligible results as one masking batch. Set to `0` for immediate compatibility masking. |
 | `PI_TOOL_MASK_ARCHIVE_DIR` | `~/.pi/agent/tool-result-archive` | Directory for archived results. |
 | `PI_TOOL_MASK_MIN_SAVINGS_TOKENS` | `32` | Minimum estimated token saving before a result is masked. |
 | `PI_TOOL_MASK_TOOLS` | `all` | Comma-separated tool allowlist. |

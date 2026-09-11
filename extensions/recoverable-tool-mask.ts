@@ -31,6 +31,7 @@
  * ---------------------
  *   PI_TOOL_MASK_ENABLED=1|0
  *   PI_TOOL_MASK_WINDOW=10
+ *   PI_TOOL_MASK_BATCH_THRESHOLD=10000
  *   PI_TOOL_MASK_ARCHIVE_DIR=/path/to/archive
  *   PI_TOOL_MASK_MIN_SAVINGS_TOKENS=32
  *   PI_TOOL_MASK_TOOLS=all                 # or: read,bash,grep
@@ -49,13 +50,14 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve } from "node:path";
 
 const DEFAULT_WINDOW = 10;
+const DEFAULT_BATCH_THRESHOLD_TOKENS = 10_000;
 const DEFAULT_MIN_SAVINGS_TOKENS = 32;
 
 function envBool(name: string, fallback: boolean): boolean {
@@ -160,12 +162,34 @@ type ArchiveRecord = {
   verified: true;
 };
 
+type MaskCandidate = {
+  index: number;
+  message: AnyMessage;
+  key: string;
+  toolName: string;
+  originalTokens: number;
+  pointerPath: string;
+  stub: string;
+  stubTokens: number;
+  reclaimableTokens: number;
+  needsArchive: boolean;
+};
+
 class ArchiveIntegrityError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ArchiveIntegrityError";
   }
 }
+
+type BatchCommit = {
+  version: 1;
+  batchId: string;
+  committedAt: string;
+  threshold: number;
+  toolCallIds: string[];
+  reclaimableTokens: number;
+};
 
 type ProviderUsageTotals = {
   calls: number;
@@ -199,6 +223,14 @@ type MaskStats = {
   currentAfterMaskToolTokens: number;
   currentSavedTokens: number;
   currentMaskedResults: number;
+  batchEvents: number;
+  batchCommittedResults: number;
+  batchCommittedTokens: number;
+  currentWaitingEligibleResults: number;
+  currentWaitingEligibleTokens: number;
+  currentCommittedMaskedResults: number;
+  lastBatchResults: number;
+  lastBatchTokens: number;
   providerUsage: ProviderUsageTotals;
 };
 
@@ -225,6 +257,14 @@ function newStats(sessionId = ""): MaskStats {
     currentAfterMaskToolTokens: 0,
     currentSavedTokens: 0,
     currentMaskedResults: 0,
+    batchEvents: 0,
+    batchCommittedResults: 0,
+    batchCommittedTokens: 0,
+    currentWaitingEligibleResults: 0,
+    currentWaitingEligibleTokens: 0,
+    currentCommittedMaskedResults: 0,
+    lastBatchResults: 0,
+    lastBatchTokens: 0,
     providerUsage: {
       calls: 0,
       input: 0,
@@ -394,6 +434,96 @@ function getSessionArchiveDir(
   return join(archiveRoot, `${safeComponent(sessionId, 40)}-${fingerprint}`);
 }
 
+function archivePaths(params: {
+  archiveRoot: string;
+  sessionId: string;
+  sessionFile: string | null;
+  message: AnyMessage;
+}): { sessionDir: string; txtPath: string; manifestPath: string } {
+  const { archiveRoot, sessionId, sessionFile, message } = params;
+  const sessionDir = getSessionArchiveDir(archiveRoot, sessionId, sessionFile);
+  const toolName = safeComponent(String(message.toolName ?? "tool"), 40);
+  const base = `${toolName}-${shortHash(String(message.toolCallId))}`;
+  return {
+    sessionDir,
+    txtPath: join(sessionDir, `${base}.txt`),
+    manifestPath: join(sessionDir, `${base}.manifest.json`),
+  };
+}
+
+function maskKey(sessionId: string, toolCallId: string): string {
+  return `${sessionId}:${toolCallId}`;
+}
+
+function batchCommitPath(sessionDir: string): string {
+  return join(sessionDir, "batch-commits.jsonl");
+}
+
+function isBatchCommit(value: unknown): value is BatchCommit {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<BatchCommit>;
+  return (
+    record.version === 1 &&
+    typeof record.batchId === "string" &&
+    typeof record.committedAt === "string" &&
+    typeof record.threshold === "number" &&
+    Array.isArray(record.toolCallIds) &&
+    record.toolCallIds.every((id) => typeof id === "string") &&
+    typeof record.reclaimableTokens === "number"
+  );
+}
+
+async function loadCommittedMaskKeys(params: {
+  sessionDir: string;
+  sessionId: string;
+}): Promise<Set<string>> {
+  const { sessionDir, sessionId } = params;
+  let contents: string;
+  try {
+    contents = await readFile(batchCommitPath(sessionDir), "utf8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return new Set();
+    throw error;
+  }
+
+  const keys = new Set<string>();
+  for (const [lineNumber, line] of contents.split("\n").entries()) {
+    if (!line.trim()) continue;
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      throw new ArchiveIntegrityError(`Invalid batch commit record at line ${lineNumber + 1}`);
+    }
+    if (!isBatchCommit(record)) {
+      throw new ArchiveIntegrityError(`Invalid batch commit schema at line ${lineNumber + 1}`);
+    }
+    for (const toolCallId of record.toolCallIds) keys.add(maskKey(sessionId, toolCallId));
+  }
+  return keys;
+}
+
+async function appendBatchCommit(params: {
+  sessionDir: string;
+  threshold: number;
+  candidates: MaskCandidate[];
+  reclaimableTokens: number;
+}): Promise<void> {
+  const { sessionDir, threshold, candidates, reclaimableTokens } = params;
+  const commit: BatchCommit = {
+    version: 1,
+    batchId: randomUUID(),
+    committedAt: new Date().toISOString(),
+    threshold,
+    toolCallIds: candidates.map((candidate) => String(candidate.message.toolCallId)),
+    reclaimableTokens,
+  };
+  await appendFile(batchCommitPath(sessionDir), `${JSON.stringify(commit)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+}
+
 function buildArchiveManifest(params: {
   sessionId: string;
   sessionFile: string | null;
@@ -487,14 +617,13 @@ async function ensureArchived(params: {
   stats: MaskStats;
 }): Promise<ArchiveRecord> {
   const { archiveRoot, sessionId, sessionFile, message, originalTokens, stats } = params;
-  const sessionDir = getSessionArchiveDir(archiveRoot, sessionId, sessionFile);
+  const { sessionDir, txtPath, manifestPath } = archivePaths({
+    archiveRoot,
+    sessionId,
+    sessionFile,
+    message,
+  });
   await mkdir(sessionDir, { recursive: true, mode: 0o700 });
-
-  const toolName = safeComponent(String(message.toolName ?? "tool"), 40);
-  const idHash = shortHash(String(message.toolCallId));
-  const base = `${toolName}-${idHash}`;
-  const txtPath = join(sessionDir, `${base}.txt`);
-  const manifestPath = join(sessionDir, `${base}.manifest.json`);
   const text = Buffer.from(textForArchive(message.content), "utf8");
   const expected = buildArchiveManifest({
     sessionId,
@@ -560,8 +689,18 @@ function statsText(params: {
   includeTools: Set<string> | null;
   excludeTools: Set<string>;
   minSavingsTokens: number;
+  batchThresholdTokens: number;
 }): string {
-  const { stats, enabled, window, archiveRoot, includeTools, excludeTools, minSavingsTokens } = params;
+  const {
+    stats,
+    enabled,
+    window,
+    archiveRoot,
+    includeTools,
+    excludeTools,
+    minSavingsTokens,
+    batchThresholdTokens,
+  } = params;
   const u = stats.providerUsage;
   const providerPrompt = u.input + u.cacheRead + u.cacheWrite;
 
@@ -580,7 +719,18 @@ function statsText(params: {
     `estimated saved:           ~${formatInt(stats.currentSavedTokens)} (${formatPct(stats.currentSavedTokens, stats.currentOriginalToolTokens)})`,
     `masked results:             ${formatInt(stats.currentMaskedResults)}`,
     ``,
+    `Batching`,
+    `batch threshold:             ~${formatInt(batchThresholdTokens)} reclaimable tokens`,
+    `waiting eligible results:    ${formatInt(stats.currentWaitingEligibleResults)}`,
+    `waiting reclaimable tokens: ~${formatInt(stats.currentWaitingEligibleTokens)}`,
+    `committed masked results:    ${formatInt(stats.currentCommittedMaskedResults)}`,
+    ``,
     `Since session start / extension reload`,
+    `batch events:                ${formatInt(stats.batchEvents)}`,
+    `results committed in batches:${formatInt(stats.batchCommittedResults)}`,
+    `reclaimable tokens committed: ~${formatInt(stats.batchCommittedTokens)}`,
+    `last batch results:          ${formatInt(stats.lastBatchResults)}`,
+    `last batch tokens:           ~${formatInt(stats.lastBatchTokens)}`,
     `LLM context hooks:           ${formatInt(stats.contextCalls)}`,
     `mask applications:           ${formatInt(stats.maskApplications)}`,
     `unique masked results:       ${formatInt(stats.uniqueMaskedResults.size)}`,
@@ -611,6 +761,11 @@ function statsText(params: {
 export default function recoverableToolMask(pi: ExtensionAPI) {
   let enabled = envBool("PI_TOOL_MASK_ENABLED", true);
   const window = envInt("PI_TOOL_MASK_WINDOW", DEFAULT_WINDOW, 1);
+  const batchThresholdTokens = envInt(
+    "PI_TOOL_MASK_BATCH_THRESHOLD",
+    DEFAULT_BATCH_THRESHOLD_TOKENS,
+    0,
+  );
   const minSavingsTokens = envInt(
     "PI_TOOL_MASK_MIN_SAVINGS_TOKENS",
     DEFAULT_MIN_SAVINGS_TOKENS,
@@ -621,21 +776,25 @@ export default function recoverableToolMask(pi: ExtensionAPI) {
   const excludeTools = parseExcludeSet(process.env.PI_TOOL_MASK_EXCLUDE_TOOLS);
 
   let stats = newStats();
+  const committedMaskedResults = new Set<string>();
 
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+    const sessionDir = getSessionArchiveDir(archiveRoot, sessionId, sessionFile);
     stats = newStats(sessionId);
+    committedMaskedResults.clear();
     try {
-      await mkdir(getSessionArchiveDir(archiveRoot, sessionId, sessionFile), {
-        recursive: true,
-        mode: 0o700,
-      });
+      await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+      for (const key of await loadCommittedMaskKeys({ sessionDir, sessionId })) {
+        committedMaskedResults.add(key);
+      }
+      stats.currentCommittedMaskedResults = committedMaskedResults.size;
     } catch (error) {
       stats.archiveFailures++;
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `Recoverable masking: archive directory unavailable; results will remain unmasked. ${String(error)}`,
+          `Recoverable masking: batch ledger unavailable; results will remain unmasked. ${String(error)}`,
           "warning",
         );
       }
@@ -675,61 +834,150 @@ export default function recoverableToolMask(pi: ExtensionAPI) {
     const callsAfter = assistantCallsAfter(messages);
     const sessionId = ctx.sessionManager.getSessionId() || stats.sessionId || "ephemeral";
     const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+    const candidates: MaskCandidate[] = [];
 
     let currentOriginalToolTokens = 0;
-    let currentAfterMaskToolTokens = 0;
-    let currentSavedTokens = 0;
-    let currentMaskedResults = 0;
 
+    // Inspect the fresh outgoing context. Only uncommitted, eligible results
+    // participate in the next threshold calculation.
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
       if (!isToolResultMessage(message)) continue;
 
+      const key = maskKey(sessionId, message.toolCallId);
       const originalChars = contentTextChars(message.content);
       const originalTokens = estimateTokensFromChars(originalChars);
       currentOriginalToolTokens += originalTokens;
 
-      // Disabled mode still computes current baseline stats but does not archive
-      // or modify anything.
-      if (!enabled) {
-        currentAfterMaskToolTokens += originalTokens;
+      if (!enabled || !shouldIncludeTool(String(message.toolName ?? "unknown"), includeTools, excludeTools)) {
+        continue;
+      }
+      if (hasImageContent(message.content)) {
+        stats.skippedImageResults++;
+        continue;
+      }
+      if (originalChars === 0 || committedMaskedResults.has(key) || callsAfter[i] < window) {
         continue;
       }
 
       const toolName = String(message.toolName ?? "unknown");
-      if (!shouldIncludeTool(toolName, includeTools, excludeTools)) {
-        currentAfterMaskToolTokens += originalTokens;
-        continue;
-      }
-
-      // Keep recent results at full fidelity. With window=10 this masks a result
-      // starting on the 11th subsequent model request.
-      if (callsAfter[i] < window) {
-        currentAfterMaskToolTokens += originalTokens;
-        continue;
-      }
-
-      if (hasImageContent(message.content)) {
-        stats.skippedImageResults++;
-        currentAfterMaskToolTokens += originalTokens;
-        continue;
-      }
-
-      if (originalChars === 0) {
-        currentAfterMaskToolTokens += originalTokens;
-        continue;
-      }
-
       const call = callMap.get(message.toolCallId);
-      // Keep recovery reads verbatim. Pointing a new tool result at an archive
-      // created for a different tool call would violate archive identity, while
-      // re-archiving recovery output would create an unnecessary chain.
-      if (archiveReadTarget(call, archiveRoot)) {
+      // Recovery reads must remain verbatim: a source archive belongs to the
+      // original call, not the read that recovered it.
+      if (archiveReadTarget(call, archiveRoot)) continue;
+
+      const paths = archivePaths({ archiveRoot, sessionId, sessionFile, message });
+      const stub = makeStub(toolName, originalTokens, paths.txtPath);
+      const stubTokens = estimateTokensFromChars(stub.length);
+      const reclaimableTokens = originalTokens - stubTokens;
+      if (reclaimableTokens < minSavingsTokens) {
+        stats.skippedTooSmallResults++;
+        continue;
+      }
+
+      candidates.push({
+        index: i,
+        message,
+        key,
+        toolName,
+        originalTokens,
+        pointerPath: paths.txtPath,
+        stub,
+        stubTokens,
+        reclaimableTokens,
+        needsArchive: true,
+      });
+    }
+
+    const waitingReclaimableTokens = candidates.reduce(
+      (sum, candidate) => sum + candidate.reclaimableTokens,
+      0,
+    );
+    stats.currentWaitingEligibleResults = candidates.length;
+    stats.currentWaitingEligibleTokens = waitingReclaimableTokens;
+
+    const shouldCommitBatch =
+      candidates.length > 0 &&
+      (batchThresholdTokens === 0 || waitingReclaimableTokens >= batchThresholdTokens);
+    const successfullyPrepared: MaskCandidate[] = [];
+
+    if (shouldCommitBatch) {
+      for (const candidate of candidates) {
+        try {
+          if (candidate.needsArchive) {
+            await ensureArchived({
+              archiveRoot,
+              sessionId,
+              sessionFile,
+              message: candidate.message,
+              originalTokens: candidate.originalTokens,
+              stats,
+            });
+            stats.uniqueArchivedResults.add(candidate.key);
+          }
+          successfullyPrepared.push(candidate);
+        } catch (error) {
+          stats.archiveFailures++;
+          if (error instanceof ArchiveIntegrityError) stats.archiveIntegrityFailures++;
+        }
+      }
+    }
+
+    const preparedReclaimableTokens = successfullyPrepared.reduce(
+      (sum, candidate) => sum + candidate.reclaimableTokens,
+      0,
+    );
+    const commitPreparedBatch =
+      successfullyPrepared.length > 0 &&
+      (batchThresholdTokens === 0 || preparedReclaimableTokens >= batchThresholdTokens);
+
+    if (commitPreparedBatch) {
+      try {
+        const sessionDir = getSessionArchiveDir(archiveRoot, sessionId, sessionFile);
+        // The durable decision precedes in-memory commitment and outgoing masking.
+        await appendBatchCommit({
+          sessionDir,
+          threshold: batchThresholdTokens,
+          candidates: successfullyPrepared,
+          reclaimableTokens: preparedReclaimableTokens,
+        });
+        for (const candidate of successfullyPrepared) committedMaskedResults.add(candidate.key);
+        stats.batchEvents++;
+        stats.batchCommittedResults += successfullyPrepared.length;
+        stats.batchCommittedTokens += preparedReclaimableTokens;
+        stats.lastBatchResults = successfullyPrepared.length;
+        stats.lastBatchTokens = preparedReclaimableTokens;
+      } catch (error) {
+        // Archives without a durable batch decision are intentionally left full.
+        stats.archiveFailures++;
+        if (error instanceof ArchiveIntegrityError) stats.archiveIntegrityFailures++;
+      }
+    }
+
+    let currentAfterMaskToolTokens = 0;
+    let currentSavedTokens = 0;
+    let currentMaskedResults = 0;
+
+    // Re-verify every committed result before masking it. A later archive
+    // corruption therefore fails open even though its batch was committed.
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (!isToolResultMessage(message)) continue;
+      const originalTokens = estimateTokensFromChars(contentTextChars(message.content));
+      const toolName = String(message.toolName ?? "unknown");
+      const key = maskKey(sessionId, message.toolCallId);
+
+      if (
+        !enabled ||
+        !committedMaskedResults.has(key) ||
+        callsAfter[i] < window ||
+        !shouldIncludeTool(toolName, includeTools, excludeTools) ||
+        hasImageContent(message.content)
+      ) {
         currentAfterMaskToolTokens += originalTokens;
         continue;
       }
 
-      let pointerPath: string;
       try {
         const archived = await ensureArchived({
           archiveRoot,
@@ -739,46 +987,29 @@ export default function recoverableToolMask(pi: ExtensionAPI) {
           originalTokens,
           stats,
         });
-        pointerPath = archived.txtPath;
-        stats.uniqueArchivedResults.add(`${sessionId}:${message.toolCallId}`);
+        const stub = makeStub(toolName, originalTokens, archived.txtPath);
+        const stubTokens = estimateTokensFromChars(stub.length);
+        message.content = [{ type: "text", text: stub }];
+        currentAfterMaskToolTokens += stubTokens;
+        currentSavedTokens += originalTokens - stubTokens;
+        currentMaskedResults++;
+        stats.maskApplications++;
+        stats.uniqueMaskedResults.add(key);
+        stats.estimatedOriginalMaskedTokens += originalTokens;
+        stats.estimatedStubTokens += stubTokens;
+        stats.estimatedExposureAvoided += originalTokens - stubTokens;
       } catch (error) {
-        // Fail open: never remove information if we cannot prove it is archived.
         stats.archiveFailures++;
         if (error instanceof ArchiveIntegrityError) stats.archiveIntegrityFailures++;
         currentAfterMaskToolTokens += originalTokens;
-        continue;
       }
-
-      const stub = makeStub(toolName, originalTokens, pointerPath);
-      const stubTokens = estimateTokensFromChars(stub.length);
-      const savings = originalTokens - stubTokens;
-
-      if (savings < minSavingsTokens) {
-        stats.skippedTooSmallResults++;
-        currentAfterMaskToolTokens += originalTokens;
-        continue;
-      }
-
-      // `event.messages` is a deep copy supplied by Pi specifically for this
-      // purpose. Only the outgoing LLM context changes; persisted JSONL remains
-      // untouched.
-      message.content = [{ type: "text", text: stub }];
-
-      currentAfterMaskToolTokens += stubTokens;
-      currentSavedTokens += savings;
-      currentMaskedResults++;
-
-      stats.maskApplications++;
-      stats.uniqueMaskedResults.add(`${sessionId}:${message.toolCallId}`);
-      stats.estimatedOriginalMaskedTokens += originalTokens;
-      stats.estimatedStubTokens += stubTokens;
-      stats.estimatedExposureAvoided += savings;
     }
 
     stats.currentOriginalToolTokens = currentOriginalToolTokens;
     stats.currentAfterMaskToolTokens = currentAfterMaskToolTokens;
     stats.currentSavedTokens = currentSavedTokens;
     stats.currentMaskedResults = currentMaskedResults;
+    stats.currentCommittedMaskedResults = committedMaskedResults.size;
 
     return { messages };
   });
@@ -796,6 +1027,7 @@ export default function recoverableToolMask(pi: ExtensionAPI) {
           includeTools,
           excludeTools,
           minSavingsTokens,
+          batchThresholdTokens,
         }),
       );
     },
