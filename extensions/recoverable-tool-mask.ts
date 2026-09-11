@@ -742,6 +742,8 @@ function statsText(params: {
     `archive integrity failures:  ${formatInt(stats.archiveIntegrityFailures)}`,
     `recovery tool calls:         ${formatInt(stats.recoveryToolCalls)}`,
     `unique recovery targets:     ${formatInt(stats.recoveredArchivePaths.size)}`,
+    `recovery target rate:      ${formatPct(stats.recoveredArchivePaths.size, stats.uniqueMaskedResults.size)} (${formatInt(stats.recoveredArchivePaths.size)} / ${formatInt(stats.uniqueMaskedResults.size)} masked)`,
+    `recoveries / 100 LLM calls: ${u.calls ? ((100 * stats.recoveryToolCalls) / u.calls).toFixed(2) : "0.00"}`,
     `skipped image results:       ${formatInt(stats.skippedImageResults)}`,
     `skipped too-small results:   ${formatInt(stats.skippedTooSmallResults)}`,
     `archive failures:            ${formatInt(stats.archiveFailures)}`,

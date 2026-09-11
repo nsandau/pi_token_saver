@@ -32,6 +32,26 @@ Update the installed package with `pi update --extensions`.
 | `PI_TOOL_MASK_TOOLS` | `all` | Comma-separated tool allowlist. |
 | `PI_TOOL_MASK_EXCLUDE_TOOLS` | empty | Comma-separated tool denylist. |
 
+## Validation
+
+Run the synthetic, zero-model-token canary against the repository source:
+
+```bash
+bun tests/pi_mask_canary_test.ts
+```
+
+Audit an archive tree without changing it:
+
+```bash
+bun scripts/pi_mask_archive_audit.ts --archive ~/.pi/agent/tool-result-archive
+```
+
+Generate a read-only report from real Pi session and archive data:
+
+```bash
+bun scripts/pi_mask_live_report.ts --sessions ~/.pi/agent/sessions --archive ~/.pi/agent/tool-result-archive
+```
+
 ## Commands
 
 - `/mask-stats` — display masking and provider-usage telemetry.
